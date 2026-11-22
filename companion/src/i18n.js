@@ -106,6 +106,9 @@ const MESSAGES = {
     pickCodex: 'Find codex.exe (the Codex program)',
     codexPickInvalid: 'That file is not Codex. Choose codex.exe (or codex.cmd if you installed it with npm).',
     emptyAnswer: '(empty answer)',
+    // Plugins: other addons asking through this one (plugins.js).
+    unknownPlugin: 'This version of the companion app has no "{name}" plugin. Update the app.',
+    pluginResend: 'Some of the data had to be sent again: ask once more.',
     unreadable: 'The request could not be read: something was covering the top-left corner of the screen.',
     unreadableScreen: 'I could not read the question on the screen: something was covering the top edge of the game window.',
     unreadableQuestion: '(unreadable question)',
@@ -195,6 +198,8 @@ const MESSAGES = {
     pickCodex: 'Busca codex.exe (el programa Codex)',
     codexPickInvalid: 'Ese archivo no es Codex. Elige codex.exe (o codex.cmd si lo instalaste con npm).',
     emptyAnswer: '(respuesta vacía)',
+    unknownPlugin: 'Esta versión de la app compañera no tiene el plugin "{name}". Actualiza la app.',
+    pluginResend: 'Hubo que volver a enviar parte de los datos: pídelo otra vez.',
     unreadable: 'La captura con la pregunta no se pudo leer: algo tapaba la esquina superior izquierda de la pantalla.',
     unreadableScreen: 'No pude leer la pregunta en la pantalla: algo tapaba el borde superior de la ventana del juego.',
     unreadableQuestion: '(pregunta ilegible)',

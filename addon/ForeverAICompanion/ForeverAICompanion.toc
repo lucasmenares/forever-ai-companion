@@ -21,4 +21,5 @@ UI.lua
 Button.lua
 Notify.lua
 Probe.lua
+Plugins.lua
 Core.lua

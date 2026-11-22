@@ -18,7 +18,8 @@ import { loadContextCache, resolveContext, saveContextCache } from './context-ca
 import { startScreenReader } from './screen-reader.js';
 import { probeReport, startProbeMonitor } from './probe.js';
 import { startVoiceInbox } from './voice-inbox.js';
-import { runInLang, t } from './i18n.js';
+import { err, runInLang, t } from './i18n.js';
+import { createPlugins } from './plugins.js';
 
 const SCREENSHOT_RE = /^WoWScrnShot_.*\.(png|tga|jpe?g)$/i;
 
@@ -107,6 +108,71 @@ export async function handleRequest(req, {
   return answer;
 }
 
+// A request from another addon, sent through ours (Plugins.lua in the addon,
+// plugins.js here): answered by its plugin with data for that addon instead
+// of a chat answer. Same bookkeeping as a question: once per id, the
+// character's unchanged sections filled in from the cache, the answer
+// published to the mailboxes and the bell rung.
+export async function handlePluginRequest(req, {
+  cfg, paths, state, plugins = {}, save = saveState, log = () => {}, onEvent = () => {},
+  contextCache = {}, saveCache = () => {}, env = {},
+}) {
+  if (state.processed.includes(req.id)) return null;
+  state.processed.push(req.id);
+
+  if (req.resetSignals) {
+    resetSignals(paths, cfg);
+    state.nextSig = 1;
+  }
+  state.nextSig = Math.max(state.nextSig, Number(req.sig) || 1);
+
+  const missing = resolveContext(req, contextCache);
+  saveCache(contextCache);
+  const extra = {};
+  if (missing.length) {
+    log(`Missing from the cache: ${missing.join(', ')}. Asking the addon to resend everything.`);
+    extra.resync = Math.floor(Date.now() / 1000);
+  }
+  if (req.context?.diagnostics) {
+    log(`Sections with errors in the game: ${JSON.stringify(req.context.diagnostics)}`);
+    delete req.context.diagnostics;
+  }
+
+  const name = String(req.ext?.name ?? '');
+  const kind = String(req.ext?.kind ?? '');
+  const ch = req.context?.character || {};
+  const who = `${ch.name ?? '?'} (${ch.class ?? '?'} ${ch.level ?? '?'})`;
+  const lang = playerLang({ lang: req.lang, client: req.context?.client });
+  log(`Request for ${name} (${kind}) from ${who}: ${req.question}`);
+  onEvent({ type: 'question', id: req.id, who, question: req.question });
+  const started = Date.now();
+  let answer;
+  try {
+    const plugin = Object.hasOwn(plugins, name) ? plugins[name] : null;
+    if (!plugin) throw runInLang(lang, () => err('unknownPlugin', { name }));
+    const out = await runInLang(lang, () => plugin.handle(req, { cfg, log, lang, ...env }));
+    answer = { id: req.id, ok: true, answer: cleanAnswer(out.text) || t('emptyAnswer'), ext: name, kind, model: out.model, data: out.data };
+    if (out.usage) answer.tokens = { i: out.usage.input, c: out.usage.cached, o: out.usage.output };
+    const spent = out.usage ? `, ${out.usage.input + out.usage.output} tokens (${out.usage.input} read, ${out.usage.cached} cached, ${out.usage.output} written)` : '';
+    log(`Result for ${name} (${kind}, ${out.model ?? '?'}, ${((Date.now() - started) / 1000).toFixed(1)} s${spent}):\n${answer.answer}`);
+  } catch (e) {
+    // Data the app no longer had: the addon sends everything with the next request.
+    const again = missing.length ? ` ${runInLang(lang, () => t('pluginResend'))}` : '';
+    answer = { id: req.id, ok: false, answer: `Error: ${e.message}${again}`, ext: name, kind };
+    log(`Error: ${e.message}`);
+  }
+  onEvent({ type: 'answer', id: req.id, who, question: req.question, ok: answer.ok, answer: plainAnswer(answer.answer), tokens: answer.tokens || null });
+
+  state.answers.push(answer);
+  publishInbox(paths, cfg, state.answers, extra);
+  if (state.nextSig <= cfg.signals) {
+    ringSignal(paths, state.nextSig);
+    state.nextSig++;
+  }
+  save(state);
+  return answer;
+}
+
 // Starts listening. Returns { stop() }.
 // guides: { current() -> newest Forever guide, onPatch() -> look for a newer one }.
 export function startWatcher({ cfg, wowDir, log = () => {}, onEvent = () => {}, screenReader = true, guides = null }) {
@@ -131,9 +197,22 @@ export function startWatcher({ cfg, wowDir, log = () => {}, onEvent = () => {}, 
   // Idle until the addon starts a channel test (see probe.js).
   const probeMonitor = startProbeMonitor({ wowDir, log });
 
+  // Other addons' requests (plugins.js) wait in a line of their own: an
+  // analysis takes minutes, and a question asked meanwhile is still answered.
+  const plugins = createPlugins();
+  let pluginQueue = Promise.resolve();
+
   // One request at a time, whatever the source.
   let queue = Promise.resolve();
   const enqueue = (req) => {
+    if (req.ext && typeof req.ext === 'object') {
+      pluginQueue = pluginQueue
+        .then(() => handlePluginRequest(req, {
+          cfg, paths, state, plugins, log, onEvent, contextCache, saveCache: saveContextCache, env: { guides, knowledge },
+        }))
+        .catch((e) => log(`Error: ${e.message}`));
+      return pluginQueue;
+    }
     queue = queue
       .then(() => handleRequest(req, {
         cfg, paths, state, system, log, onEvent, contextCache, saveCache: saveContextCache, probeMonitor,

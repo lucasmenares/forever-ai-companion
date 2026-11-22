@@ -157,6 +157,10 @@ local EN = {
   READ_FAILED = "Couldn't read the question.",
   TRY_AGAIN = "Try again.",
   DOESNT_FIT = "The question and data don't fit on the screen.",
+  -- Requests from other addons (Plugins.lua)
+  PLUGIN_NOT_READY = "Forever AI Companion hasn't finished loading.",
+  PLUGIN_TOO_BIG = "Too much data for the on-screen line. Turn on invisible sending in the companion app, restart WoW and try again.",
+  PLUGIN_EXPIRED = "The result arrived while you were away and is no longer kept. Ask again.",
   SEND_IN_PROGRESS = "A send is already in progress.",
 
   -- Slash commands
@@ -408,6 +412,9 @@ local ES = {
   READ_FAILED = "No se pudo leer la pregunta.",
   TRY_AGAIN = "Vuelve a intentarlo.",
   DOESNT_FIT = "La pregunta y los datos no caben en la pantalla.",
+  PLUGIN_NOT_READY = "Forever AI Companion no ha terminado de cargar.",
+  PLUGIN_TOO_BIG = "Demasiados datos para la línea en pantalla. Activa el envío invisible en la app compañera, reinicia WoW y vuelve a intentarlo.",
+  PLUGIN_EXPIRED = "El resultado llegó mientras no estabas y ya no se conserva. Vuelve a pedirlo.",
   SEND_IN_PROGRESS = "Ya hay un envío en curso.",
 
   -- Comandos

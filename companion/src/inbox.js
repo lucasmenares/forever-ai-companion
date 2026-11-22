@@ -12,6 +12,12 @@ export function luaString(s) {
     + '"';
 }
 
+// Words that can't be written as a bare table key.
+const LUA_KEYWORDS = new Set([
+  'and', 'break', 'do', 'else', 'elseif', 'end', 'false', 'for', 'function', 'goto', 'if', 'in', 'local', 'nil', 'not', 'or',
+  'repeat', 'return', 'then', 'true', 'until', 'while',
+]);
+
 export function toLua(value, indent = '') {
   if (value === null || value === undefined) return 'nil';
   if (typeof value === 'boolean') return value ? 'true' : 'false';
@@ -26,7 +32,7 @@ export function toLua(value, indent = '') {
   if (entries.length === 0) return '{}';
   return '{\n' + entries
     .map(([k, v]) => {
-      const key = /^[A-Za-z_][A-Za-z0-9_]*$/.test(k) ? k : `[${luaString(k)}]`;
+      const key = /^[A-Za-z_][A-Za-z0-9_]*$/.test(k) && !LUA_KEYWORDS.has(k) ? k : `[${luaString(k)}]`;
       return `${next}${key} = ${toLua(v, next)},`;
     })
     .join('\n') + '\n' + indent + '}';
@@ -82,9 +88,28 @@ function deliver(paths, fn) {
   }
 }
 
+// A plugin's answer carries data (a talent build, a gear plan...). Only the
+// newest ones keep it: the addon takes an answer the moment it arrives, and
+// every mailbox file holds every answer.
+export const KEEP_DATA = 4;
+export function withoutOldData(answers, keep = KEEP_DATA) {
+  let kept = 0;
+  const out = [];
+  for (let i = answers.length - 1; i >= 0; i--) {
+    const a = answers[i];
+    if (a && a.data !== undefined && ++kept > keep) {
+      const { data, ...rest } = a;
+      out.push({ ...rest, dataDropped: true });
+    } else {
+      out.push(a);
+    }
+  }
+  return out.reverse();
+}
+
 export function publishInbox(paths, cfg, answers, extra = {}) {
   deliver(paths, (p) => {
-    const src = inboxSource(answers.slice(-cfg.keepAnswers), extra, p.inboxGlobal);
+    const src = inboxSource(withoutOldData(answers.slice(-cfg.keepAnswers)), extra, p.inboxGlobal);
     for (let i = 1; i <= cfg.slots; i++) {
       writeAtomic(`${p.slotDir(i)}/Inbox.lua`, src);
     }

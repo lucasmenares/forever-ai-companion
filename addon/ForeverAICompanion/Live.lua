@@ -27,6 +27,10 @@ local OK_PATH = "Interface\\AddOns\\ForeverAICompanion\\sig\\ok.wav"
 -- Seconds after sending at which a slot is loaded anyway.
 local SCHEDULE_NO_SOUND = { 8, 20, 40, 75, 120, 240 } -- sound disabled: no signals
 local SCHEDULE_SAFETY = { 90, 240 }                   -- signals on: only as a safety net
+-- A plugin's request (Plugins.lua) takes minutes to answer: open fewer
+-- mailboxes while waiting, as each can be opened once per session.
+local SCHEDULE_SLOW_NO_SOUND = { 45, 90, 150, 240, 360, 540 }
+local SCHEDULE_SLOW_SAFETY = { 300, 720 }
 -- App status (see Live:CheckApp).
 local STATUS_PATH = "Interface\\AddOns\\ForeverAICompanion\\sig\\%s.wav"
 local APP_TICK = 2  -- the app switches its beat every 3 s: check faster than that
@@ -106,13 +110,14 @@ function Live:Init()
       end
     end
   end
-  -- Pick up anything answered while we were away.
-  if ns.Core:HasPending() then self:LoadNextSlot() end
+  -- Pick up anything answered while we were away (a plugin's answer may have
+  -- taken long enough to arrive after the game was closed).
+  if ns.Core:HasPending() or (ns.Plugins and ns.Plugins:AwaitingLate()) then self:LoadNextSlot() end
   C_Timer.NewTicker(TICK, function() Live:Tick() end)
   -- Is the app open and ready? Checked while the window is open (it opening
-  -- checks right away, see UI.lua).
+  -- checks right away, see UI.lua), or while a plugin's window asks for it.
   C_Timer.NewTicker(APP_TICK, function()
-    if ns.UI:IsShown() then Live:CheckApp() end
+    if ns.UI:IsShown() or (ns.Plugins and ns.Plugins:Watching()) then Live:CheckApp() end
   end)
 end
 
@@ -213,7 +218,10 @@ function Live:ApplyAppCheck(plays)
       end
     end
   end
-  if app.state ~= before then ns.UI:RefreshStatusBar() end
+  if app.state ~= before then
+    ns.UI:RefreshStatusBar()
+    if ns.Plugins then ns.Plugins:AppStateChanged(app.state) end
+  end
   return self:AppState()
 end
 
@@ -229,9 +237,11 @@ function Live:RequestFields()
   return db.nextSig, db.pendingReset or nil
 end
 
-function Live:OnSent()
+-- slow: a plugin's request, answered in minutes rather than seconds.
+function Live:OnSent(slow)
   self.sentAt = GetTime()
   self.scheduleIndex = 1
+  self.slow = slow and true or nil
 end
 
 function Live:OnAnswer()
@@ -240,7 +250,10 @@ function Live:OnAnswer()
 end
 
 function Live:Tick()
-  if not ns.Core:HasPending() then return end
+  local waiting = ns.Core:HasPending()
+  -- A plugin's answer that is only late: the bell is still listened for, but
+  -- no mailbox is opened on the timer for it.
+  if not waiting and not (ns.Plugins and ns.Plugins:ListeningLate()) then return end
   local db = ns.db
   self.soundOK = playable(OK_PATH) and not self.noSignals
   local useSignals = self.soundOK and not db.sigWait and db.nextSig <= self.SIGNALS and not self.scanning
@@ -266,8 +279,10 @@ function Live:Tick()
     end
   end
 
-  if self.sentAt then
-    local schedule = useSignals and SCHEDULE_SAFETY or SCHEDULE_NO_SOUND
+  if self.sentAt and waiting then
+    local schedule
+    if self.slow then schedule = useSignals and SCHEDULE_SLOW_SAFETY or SCHEDULE_SLOW_NO_SOUND
+    else schedule = useSignals and SCHEDULE_SAFETY or SCHEDULE_NO_SOUND end
     local due = schedule[self.scheduleIndex]
     if not due then due = schedule[#schedule] + 240 * (self.scheduleIndex - #schedule) end
     if GetTime() - self.sentAt >= due then

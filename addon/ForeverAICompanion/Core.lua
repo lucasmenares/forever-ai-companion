@@ -50,6 +50,8 @@ function Core:HasPending()
   if resend then
     C_Timer.After(0, function() Core:Ask(resend.question, nil, resend.chatId, resend.entry) end)
   end
+  -- Requests other addons sent through this one (Plugins.lua).
+  if ns.Plugins and ns.Plugins:HasPending(now) then any = true end
   return any
 end
 
@@ -199,12 +201,31 @@ end
 -- in `same`, and the companion fills them in from its cache.
 -- maxBytes: size limit for channels without the screen's limits (voice).
 -- extra: more context for this question only (e.g. the items linked in it).
-function Core:BuildFrame(req, step, maxBytes, extra)
+-- plugin: a request from another addon (Plugins.lua): { context = false } to
+-- leave the character's data out, { only = { section = true } } to send just
+-- those sections of it, { sections = { name = value } } for the plugin's own
+-- data, which is skipped like ours once the companion has it.
+function Core:BuildFrame(req, step, maxBytes, extra, plugin)
   local fits = maxBytes and function(len) return len <= maxBytes end
     or function(len) return ns.Uplink:Fits(len) end
   local t0 = now()
-  local snap, meta, errors = ns.Collect:Gather(step)
+  local snap, meta, errors
+  if plugin and plugin.context == false then
+    snap, meta, errors = {}, {}, {}
+  else
+    snap, meta, errors = ns.Collect:Gather(step)
+  end
+  if plugin and plugin.only then
+    for k in pairs(snap) do
+      if not plugin.only[k] then snap[k] = nil end
+    end
+  end
   for k, v in pairs(extra or {}) do snap[k] = v end
+  for k, v in pairs(plugin and plugin.sections or {}) do
+    local json = ns.Json.Encode(v)
+    snap[k], meta[k] = v, { value = v, json = json, hash = ns.Json.Hash(json) }
+    step()
+  end
   local t1 = now()
   local acked = self:CharData().acked or {}
   local ctx, encoded, hashes, same = {}, {}, {}, {}
@@ -487,6 +508,8 @@ function Core:ApplyInbox(inbox)
       entry.sent = nil
     end
   end
+  -- Answers to requests other addons sent through this one (Plugins.lua).
+  if ns.Plugins and ns.Plugins:ApplyInbox(inbox, data) > 0 then ns.Live:OnAnswer() end
   -- The companion lost its cache: send everything next time.
   if inbox.resync and tonumber(inbox.resync) and tonumber(inbox.resync) > (data.resyncSeen or 0) then
     data.resyncSeen = tonumber(inbox.resync)
