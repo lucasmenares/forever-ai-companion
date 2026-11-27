@@ -267,6 +267,22 @@ async function macPick(kind, title) {
 }
 
 export async function pickFolder() {
+  if (process.platform === 'linux') {
+    const { execFile } = await import('node:child_process');
+    return new Promise((resolve, reject) => {
+      execFile('zenity', [
+        '--file-selection',
+        '--directory',
+        '--title=Choose WoW Folder'
+      ], (error, stdout) => {
+        if (error && error.code !== 1) {
+          reject(error);
+        } else {
+          resolve(error ? null : stdout.trim() || null);
+        }
+      });
+    });
+  }
   if (isMac) return macPick('pick-folder', t('pickFolder'));
   if (!isWindows) throw err('typePath');
   const out = await powershell(`

@@ -1,3 +1,4 @@
+import { startLinuxScreenReader } from './screen-reader-linux.js';
 // Reads the addon's strip straight from the screen while the game runs.
 //
 // A small helper (PowerShell + C#, both built into Windows) watches a tiny
@@ -161,6 +162,7 @@ ${CSHARP}
 // Starts the helper and restarts it if it dies. onFrame({ seq, attempt, width, height, channels, data }).
 // wholeScreen: watch the top of the primary screen instead of the WoW window (tests).
 export function startScreenReader({ onFrame, log = () => {}, captureHeight = CAPTURE_HEIGHT, wholeScreen = false, helper = nativeHelper }) {
+  if (process.platform === 'linux') return startLinuxScreenReader({ onFrame, log, captureHeight });
   const mac = process.platform === 'darwin';
   if (process.platform !== 'win32' && !mac) return { stop() {} };
   const macExe = mac ? helper() : null;
