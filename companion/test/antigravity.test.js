@@ -7,16 +7,15 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import {
-  ANTIGRAVITY_CODE_REDIRECT_URI, ANTIGRAVITY_NOTE, antigravityArgs, antigravityAuthStatus, antigravityInput,
-  antigravityLoginState, antigravitySettings, antigravityUsage, cancelAntigravityLogin, fallbackAntigravityEffort,
-  findAntigravity, friendlyAntigravityError, friendlyAntigravityLoginError, parseAntigravityAuthStatus,
-  parseAntigravityAuthUrl, parseAntigravityEvents, parseAntigravityLoginCode, parseAntigravityModels,
-  prettyAntigravityModel, resolveAntigravityModel, startAntigravityLogin, stopAntigravityLogin,
-  submitAntigravityLoginCode,
+  ANTIGRAVITY_CODE_REDIRECT_URI, ANTIGRAVITY_NOTE, antigravityAcpArgs, antigravityAuthStatus,
+  antigravityLoginState, antigravityUsage, cancelAntigravityLogin, fallbackAntigravityEffort, findAntigravity,
+  friendlyAntigravityError, friendlyAntigravityLoginError, isAntigravityAuthError, parseAntigravityAuthStatus,
+  parseAntigravityAuthUrl, parseAntigravityLoginCode, parseAntigravityModels, prettyAntigravityModel,
+  resolveAntigravityModel, startAntigravityLogin, stopAntigravityLogin, submitAntigravityLoginCode,
 } from '../src/antigravity.js';
 import { ROOT, applyPreset, env, loadConfig } from '../src/config.js';
 import { runInLang, t } from '../src/i18n.js';
-import { ask, canSearch } from '../src/providers.js';
+import { ask, canSearch, sandboxDir } from '../src/providers.js';
 import { createController } from '../src/app/controller.js';
 import { createServer } from '../src/app/server.js';
 
@@ -36,6 +35,9 @@ test('model and effort resolution maps bare models and keeps explicit slugs', ()
   assert.deepEqual(resolveAntigravityModel('gemini-pro-orchestrator-neon', 'low'), { model: 'gemini-pro-orchestrator-neon', effort: null });
 
   assert.equal(fallbackAntigravityEffort("Effort isn't adjustable for Orchestrator (Neon).", 'low'), null);
+  assert.equal(fallbackAntigravityEffort('Thinking level "low" is not offered for model "Orchestrator (Neon)"', 'low'), null);
+  assert.equal(fallbackAntigravityEffort('Thinking level "low" is not offered for model "Gemini 3.8 Flash"', 'low', ['medium', 'high']), 'medium');
+  assert.equal(fallbackAntigravityEffort('Thinking level "low" is not available without an active model', 'low'), null);
   assert.equal(fallbackAntigravityEffort('gemini-3.8-flash has no "low" effort (available: medium, high)', 'low'), 'medium');
   assert.equal(fallbackAntigravityEffort('x has no "max" effort (available: low, medium, high)', 'max'), 'low');
   assert.equal(fallbackAntigravityEffort('rate limit exceeded', 'low'), undefined);
@@ -53,82 +55,29 @@ test('pretty model names format Gemini, Orchestrator and Claude variants', () =>
   assert.equal(prettyAntigravityModel('claude-sonnet-5-5'), 'Claude Sonnet 5.5');
 });
 
-test('ephemeral settings and CLI args lock down local tools and toggle web reading', () => {
-  const withoutWeb = antigravitySettings({ webSearch: false });
-  assert.equal(withoutWeb.agentMode, '');
-  assert.equal(withoutWeb.toolPermission, 'request-review');
-  assert.equal(withoutWeb.allowNonWorkspaceAccess, false);
-  assert.equal(withoutWeb.enableTerminalSandbox, true);
-  assert.equal(withoutWeb.disableSlashCommands, true);
-  assert.deepEqual(withoutWeb.permissions.allow, []);
-  for (const rule of ['command(*)', 'read_file(*)', 'write_file(*)', 'execute_url(*)', 'mcp(*)', 'read_url(*)']) {
-    assert.ok(withoutWeb.permissions.deny.includes(rule), rule);
-  }
+test('ACP args, usage, models, auth status, and localized errors match Antigravity CLI formats', () => {
+  assert.deepEqual(antigravityAcpArgs(), ['acp', '--stdio']);
+  assert.deepEqual(antigravityAcpArgs({ extraArgs: ['--sandbox'] }), ['acp', '--stdio', '--sandbox']);
 
-  const withWeb = antigravitySettings({ webSearch: true });
-  assert.deepEqual(withWeb.permissions.allow, ['read_url(*)']);
-  assert.ok(!withWeb.permissions.deny.includes('read_url(*)'));
+  assert.equal(isAntigravityAuthError({ code: -32000, message: 'Authentication required' }), true);
+  assert.equal(isAntigravityAuthError('Please sign in'), true);
+  assert.equal(isAntigravityAuthError('HTTP 401 Unauthorized'), true);
+  assert.equal(isAntigravityAuthError('rate limit exceeded'), false);
 
-  const args = antigravityArgs({ model: 'gemini-4-hydrogen', effort: 'low' }, {
-    settingsFile: 'C:\\tmp\\agy-settings.json', webSearch: true, timeoutMs: 180000,
-  });
-  const at = (f) => args[args.indexOf(f) + 1];
-  assert.equal(at('--input-format'), 'stream-json');
-  assert.equal(at('--output-format'), 'stream-json');
-  assert.ok(args.includes('--disable-slash-commands'));
-  assert.ok(args.includes('--sandbox'));
-  assert.equal(at('--settings'), 'C:\\tmp\\agy-settings.json');
-  assert.equal(at('--print-timeout'), '180s');
-  assert.equal(at('--model'), 'gemini-4-hydrogen-low');
-  assert.ok(!args.includes('--effort'));
-
-  const defArgs = antigravityArgs({ model: 'default', effort: 'low' }, { settingsFile: 's.json' });
-  assert.ok(!defArgs.includes('--model'));
-  assert.equal(defArgs[defArgs.indexOf('--effort') + 1], 'low');
-
-  const dropped = antigravityArgs({ model: 'default', effort: 'low' }, { settingsFile: 's.json', effortOverride: null });
-  assert.ok(!dropped.includes('--effort'));
-
-  const line = antigravityInput('Hola');
-  assert.ok(line.endsWith('\n'));
-  assert.deepEqual(JSON.parse(line), { event: 'user', message: { content: 'Hola' } });
-});
-
-test('events, usage, models and auth status parsing match Antigravity CLI formats', () => {
-  const stream = [
-    'Warning: minor notice',
-    JSON.stringify({ event: 'init', conversation_id: 'c1', init: { model: 'gemini-4-hydrogen-low' } }),
-    JSON.stringify({ event: 'step_update', step_update: { step_type: 'agent_response', state: 'ACTIVE', text_delta: 'Go to ' } }),
-    JSON.stringify({ event: 'step_update', step_update: { step_type: 'agent_response', state: 'DONE', text_delta: 'Deadmines.' } }),
-    JSON.stringify({
-      event: 'result',
-      result: {
-        status: 'SUCCESS',
-        response: 'Go to Deadmines.\n',
-        usage: { input_tokens: 10415, output_tokens: 657, thinking_tokens: 616, cache_read_tokens: 8113, total_tokens: 11072 },
-      },
-    }),
-  ].join('\n');
-  const parsed = parseAntigravityEvents(stream);
-  assert.equal(parsed.text, 'Go to Deadmines.\n');
-  assert.equal(parsed.error, null);
-  assert.equal(parsed.model, 'gemini-4-hydrogen-low');
-  assert.deepEqual(antigravityUsage(parsed.usage), { input: 10415, cached: 8113, output: 657 });
-
-  // Delta fallback if result.response is omitted; Claude-style uncached input_tokens.
-  const claudeStyle = parseAntigravityEvents([
-    JSON.stringify({ event: 'step_update', step_update: { step_type: 'agent_response', state: 'DONE', text_delta: 'Hi' } }),
-    JSON.stringify({ event: 'result', result: { status: 'SUCCESS', usage: { input_tokens: 278, output_tokens: 4, thinking_tokens: 12, cache_read_tokens: 30214 } } }),
-  ].join('\n'));
-  assert.equal(claudeStyle.text, 'Hi');
-  assert.deepEqual(antigravityUsage(claudeStyle.usage), { input: 30492, cached: 30214, output: 12 });
+  // ACP camelCase Gemini usage vs Claude-style uncached inputTokens.
+  assert.deepEqual(
+    antigravityUsage({ inputTokens: 10415, outputTokens: 657, thoughtTokens: 616, cachedReadTokens: 8113, totalTokens: 11072 }),
+    { input: 10415, cached: 8113, output: 657 },
+  );
+  assert.deepEqual(
+    antigravityUsage({ inputTokens: 278, outputTokens: 4, thoughtTokens: 12, cachedReadTokens: 30214 }),
+    { input: 30492, cached: 30214, output: 12 },
+  );
+  assert.deepEqual(
+    antigravityUsage({ input_tokens: 10415, output_tokens: 657, thinking_tokens: 616, cache_read_tokens: 8113 }),
+    { input: 10415, cached: 8113, output: 657 },
+  );
   assert.equal(antigravityUsage(null), null);
-
-  // Error envelope in stream-json and single json.
-  const errEv = parseAntigravityEvents(JSON.stringify({ event: 'result', result: { status: 'ERROR', error: 'Authentication required' } }));
-  assert.equal(errEv.error, 'Authentication required');
-  const singleErr = parseAntigravityEvents(JSON.stringify({ status: 'ERROR', finished_reason: 'print_timeout' }));
-  assert.equal(singleErr.error, 'ERROR (print_timeout)');
 
   const modelsJson = JSON.stringify({
     conversation_id: '',
@@ -201,7 +150,10 @@ test('events, usage, models and auth status parsing match Antigravity CLI format
   assert.match(runInLang('en', () => friendlyAntigravityError('weekly rate limit reached')), /usage limit/);
   assert.match(runInLang('es', () => friendlyAntigravityError('429 quota exceeded')), /límite de uso/);
   assert.match(runInLang('en', () => friendlyAntigravityError('invalid model selection (--model "x")')), /does not include/);
+  assert.match(runInLang('en', () => friendlyAntigravityError('Unknown model ID: gemini-4-neon')), /does not include/);
+  assert.match(runInLang('en', () => friendlyAntigravityError('"gemini-4-neon" is unavailable')), /does not include/);
   assert.match(runInLang('es', () => friendlyAntigravityError('not recognized as a known model')), /no incluye ese modelo/);
+  assert.match(runInLang('es', () => friendlyAntigravityError('Unknown model ID: gemini-4-neon')), /no incluye ese modelo/);
   assert.match(runInLang('de', () => friendlyAntigravityError('HTTP 401 Unauthorized')), /nicht angemeldet/);
   // Numbers and words that only contain the codes or "login" are not mistaken for them.
   assert.match(runInLang('en', () => friendlyAntigravityError('the answer used 1429 tokens and stopped')), /^Antigravity CLI: the answer/);
@@ -247,7 +199,8 @@ test('findAntigravity detects configured absolute paths and default Windows loca
   }
 });
 
-// Stand-in for `agy`: logs args, stdin, settings file, and env; simulates models, effort fallback, and errors.
+// Stand-in for `agy`: handles `models` and `acp --stdio` JSON-RPC; logs calls and simulates
+// config options, permissions, effort fallback, and errors.
 const FAKE_AGY = `
 import fs from 'node:fs';
 const args = process.argv.slice(2);
@@ -280,33 +233,140 @@ if (args.includes('models')) {
   }
   process.exit(0);
 }
-let stdin = '';
-process.stdin.on('data', (d) => { stdin += d; });
-process.stdin.on('end', () => {
-  const settingsPath = args[args.indexOf('--settings') + 1];
-  const rawSettings = fs.readFileSync(settingsPath);
-  const hasBom = rawSettings[0] === 0xef && rawSettings[1] === 0xbb && rawSettings[2] === 0xbf;
-  const settings = JSON.parse(rawSettings.toString('utf8'));
-  record({ cmd: 'chat', args, stdin, settings, hasBom, noUpdate: process.env.AGY_CLI_DISABLE_AUTO_UPDATE });
-  if (process.env.FAKE_AGY_ORCHESTRATOR === '1' && args.includes('--effort')) {
-    console.log(JSON.stringify({ event: 'result', result: { status: 'ERROR', error: "Effort isn't adjustable for Orchestrator (Neon)." } }));
-    process.exit(1);
-  }
-  if (process.env.FAKE_AGY_FAIL) {
-    console.log(JSON.stringify({ event: 'result', result: { status: 'ERROR', error: process.env.FAKE_AGY_FAIL } }));
-    process.exit(1);
-  }
-  console.log(JSON.stringify({ event: 'init', conversation_id: 'conv-1', init: { model: 'gemini-4-hydrogen-low' } }));
-  console.log(JSON.stringify({ event: 'step_update', step_update: { step_type: 'agent_response', state: 'DONE', text_delta: 'Ve a Minas de la Muerte.' } }));
-  console.log(JSON.stringify({
-    event: 'result',
-    result: {
-      status: 'SUCCESS',
-      response: 'Ve a Minas de la Muerte.',
-      usage: { input_tokens: 120, output_tokens: 15, thinking_tokens: 5, cache_read_tokens: 40 },
-    },
-  }));
-});
+
+if (args[0] === 'acp' && args.includes('--stdio')) {
+  let buf = '';
+  let nextReqId = 500;
+  let activeModel = process.env.FAKE_AGY_ORCHESTRATOR === '1' ? 'gemini-pro-orchestrator-neon' : 'gemini-4-hydrogen';
+  let activeEffort = 'medium';
+  const pendingClient = new Map();
+  const send = (obj) => process.stdout.write(JSON.stringify(obj) + '\\n');
+  const callClient = (method, params) => new Promise((resolve) => {
+    const id = nextReqId++;
+    pendingClient.set(id, resolve);
+    send({ jsonrpc: '2.0', id, method, params });
+  });
+  const currentConfigOptions = () => {
+    const opts = [
+      {
+        id: 'model',
+        name: 'Model',
+        category: 'model',
+        type: 'select',
+        currentValue: activeModel,
+        options: [
+          { value: 'gemini-4-neon', name: 'Gemini 4 Neon' },
+          { value: 'gemini-4-hydrogen', name: 'Gemini 4 Hydrogen' },
+          { value: 'gemini-3.8-flash', name: 'Gemini 3.8 Flash' },
+          { value: 'gemini-pro-orchestrator-neon', name: 'Orchestrator (Neon)' },
+        ],
+      },
+    ];
+    if (process.env.FAKE_AGY_ORCHESTRATOR !== '1') {
+      const levels = process.env.FAKE_AGY_NO_LOW_EFFORT === '1'
+        ? [{ value: 'medium', name: 'Medium' }, { value: 'high', name: 'High' }]
+        : [{ value: 'low', name: 'Low' }, { value: 'medium', name: 'Medium' }, { value: 'high', name: 'High' }, { value: 'xhigh', name: 'Extra' }];
+      opts.push({ id: 'thought_level', name: 'Thinking level', category: 'thought_level', type: 'select', currentValue: activeEffort, options: levels });
+    }
+    return opts;
+  };
+
+  process.stdin.on('data', async (chunk) => {
+    buf += String(chunk);
+    const lines = buf.split(/\\r?\\n/);
+    buf = lines.pop() ?? '';
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      const msg = JSON.parse(line);
+      if (msg.id !== undefined && !msg.method && pendingClient.has(msg.id)) {
+        const done = pendingClient.get(msg.id);
+        pendingClient.delete(msg.id);
+        done(msg);
+        continue;
+      }
+      if (msg.method === 'initialize') {
+        record({ cmd: 'acp-init', args, cwd: process.cwd(), noUpdate: process.env.AGY_CLI_DISABLE_AUTO_UPDATE, params: msg.params });
+        send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: { protocolVersion: 1, agentCapabilities: {}, agentInfo: { name: 'Antigravity ACP Server', version: '1.5.15' } },
+        });
+      } else if (msg.method === 'session/new') {
+        record({ cmd: 'acp-new', params: msg.params });
+        if (process.env.FAKE_AGY_NO_LOW_EFFORT === '1') activeEffort = 'high';
+        send({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 'sess-1', configOptions: currentConfigOptions() } });
+      } else if (msg.method === 'session/set_config_option') {
+        record({ cmd: 'acp-config', params: msg.params });
+        if (msg.params?.configId === 'model') {
+          if (process.env.FAKE_AGY_REJECT_MODEL === '1') {
+            send({ jsonrpc: '2.0', id: msg.id, error: { code: -32602, message: 'Unknown model ID: ' + msg.params.value } });
+            continue;
+          }
+          activeModel = msg.params.value;
+        } else if (msg.params?.configId === 'thought_level') {
+          if (process.env.FAKE_AGY_REJECT_LOW_EFFORT === '1' && msg.params.value === 'low') {
+            send({ jsonrpc: '2.0', id: msg.id, error: { code: -32602, message: 'Thinking level "low" is not offered for model "Gemini 3.8 Flash"' } });
+            continue;
+          }
+          activeEffort = msg.params.value;
+        }
+        send({ jsonrpc: '2.0', id: msg.id, result: { configOptions: currentConfigOptions() } });
+      } else if (msg.method === 'session/prompt') {
+        if (process.env.FAKE_AGY_FAIL) {
+          record({ cmd: 'acp-prompt', params: msg.params, error: process.env.FAKE_AGY_FAIL });
+          send({ jsonrpc: '2.0', id: msg.id, error: { code: -32000, message: process.env.FAKE_AGY_FAIL } });
+          continue;
+        }
+        const perms = [];
+        if (process.env.FAKE_AGY_TEST_PERMS === '1') {
+          const cmdPerm = await callClient('session/request_permission', {
+            sessionId: msg.params.sessionId,
+            toolCall: { toolCallId: 'tc-cmd', kind: 'execute', title: 'Run pwd', rawInput: { CommandLine: 'pwd' } },
+            options: [
+              { optionId: 'allow-once', name: 'Allow once', kind: 'allow_once' },
+              { optionId: 'reject-once', name: 'Reject once', kind: 'reject_once' },
+            ],
+          });
+          const webPerm = await callClient('session/request_permission', {
+            sessionId: msg.params.sessionId,
+            toolCall: {
+              toolCallId: 'tc-web',
+              kind: 'fetch',
+              name: 'read_url_content',
+              title: 'Read URL content from https://www.wowhead.com/forever/guide/deadmines',
+              rawInput: { Url: 'https://www.wowhead.com/forever/guide/deadmines' },
+            },
+            options: [
+              { optionId: 'allow-once', name: 'Allow once', kind: 'allow_once' },
+              { optionId: 'reject-once', name: 'Reject once', kind: 'reject_once' },
+            ],
+          });
+          perms.push({ tool: 'cmd', outcome: cmdPerm.result?.outcome }, { tool: 'web', outcome: webPerm.result?.outcome });
+        }
+        record({ cmd: 'acp-prompt', params: msg.params, perms, model: activeModel, effort: activeEffort });
+        send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: { sessionId: msg.params.sessionId, update: { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'internal reasoning' } } },
+        });
+        send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: { sessionId: msg.params.sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Ve a Minas de la Muerte.' } } },
+        });
+        send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: {
+            stopReason: 'end_turn',
+            usage: { inputTokens: 120, outputTokens: 15, thoughtTokens: 5, cachedReadTokens: 40, totalTokens: 135 },
+          },
+        });
+      }
+    }
+  });
+  process.stdin.on('end', () => process.exit(0));
+}
 `;
 
 test('asking through Antigravity end to end (fake agy in a folder with spaces)', { skip: !isWin }, async (t) => {
@@ -318,23 +378,26 @@ test('asking through Antigravity end to end (fake agy in a folder with spaces)',
   const logFile = path.join(dir, 'calls.json');
   process.env.FAKE_AGY_LOG = logFile;
   t.after(() => {
-    delete process.env.FAKE_AGY_LOG;
-    delete process.env.FAKE_AGY_FAIL;
-    delete process.env.FAKE_AGY_SIGNED_OUT;
-    delete process.env.FAKE_AGY_ORCHESTRATOR;
-    delete process.env.FAKE_AGY_LEGACY_MODELS;
+    for (const k of [
+      'FAKE_AGY_LOG', 'FAKE_AGY_FAIL', 'FAKE_AGY_SIGNED_OUT', 'FAKE_AGY_ORCHESTRATOR',
+      'FAKE_AGY_LEGACY_MODELS', 'FAKE_AGY_TEST_PERMS', 'FAKE_AGY_NO_LOW_EFFORT',
+      'FAKE_AGY_REJECT_LOW_EFFORT', 'FAKE_AGY_REJECT_MODEL',
+    ]) {
+      delete process.env[k];
+    }
   });
 
   const cfg = applyPreset({ ...loadConfig(path.join(dir, 'none.json')), preset: 'antigravity', timeoutMs: 30000 });
   cfg.antigravity = { ...cfg.antigravity, bin };
   const messages = [{ role: 'user', content: '¿Qué hago ahora?' }];
 
-  // Signed out: pre-check fails fast without hanging and returns localized sign-in error.
+  // 1. Signed out: pre-check fails fast without hanging and returns localized sign-in error.
   process.env.FAKE_AGY_SIGNED_OUT = '1';
   await assert.rejects(runInLang('es', () => ask(cfg, 'Eres Fizzi.', messages, {})), /sesión iniciada/);
   delete process.env.FAKE_AGY_SIGNED_OUT;
 
-  // Normal request with web search enabled.
+  // 2. Normal ACP request with web search enabled: rejects local execute, allows public web fetch, ignores thoughts.
+  process.env.FAKE_AGY_TEST_PERMS = '1';
   const r1 = await runInLang('es', () => ask(cfg, 'Eres Fizzi.', messages, {}));
   assert.equal(r1.text, 'Ve a Minas de la Muerte.');
   assert.match(r1.model, /Gemini 4 Hydrogen.*suscripción/);
@@ -343,48 +406,94 @@ test('asking through Antigravity end to end (fake agy in a folder with spaces)',
   let calls = JSON.parse(fs.readFileSync(logFile, 'utf8'));
   assert.equal(calls[0].cmd, 'models');
   assert.equal(calls[1].cmd, 'models');
-  const chat1 = calls[2];
-  assert.equal(chat1.noUpdate, 'true');
-  assert.equal(chat1.hasBom, false);
-  assert.deepEqual(chat1.settings.permissions.allow, ['read_url(*)']);
-  assert.ok(chat1.settings.permissions.deny.includes('command(*)'));
-  assert.ok(!fs.existsSync(chat1.args[chat1.args.indexOf('--settings') + 1]), 'temp settings file is removed');
-  const prompt1 = JSON.parse(chat1.stdin.trim());
-  assert.equal(prompt1.event, 'user');
-  assert.match(prompt1.message.content, /^Eres Fizzi\./);
-  assert.ok(prompt1.message.content.includes(ANTIGRAVITY_NOTE));
-  assert.match(prompt1.message.content, /¿Qué hago ahora\?/);
+  const init1 = calls[2];
+  assert.equal(init1.cmd, 'acp-init');
+  assert.deepEqual(init1.args, ['acp', '--stdio']);
+  assert.equal(init1.cwd, sandboxDir());
+  assert.equal(init1.noUpdate, 'true');
+  assert.deepEqual(init1.params.clientCapabilities, {});
+  assert.deepEqual(calls[3], { cmd: 'acp-new', params: { cwd: sandboxDir(), mcpServers: [] } });
+  assert.deepEqual(calls[4], { cmd: 'acp-config', params: { sessionId: 'sess-1', configId: 'thought_level', value: 'low' } });
+  const prompt1 = calls[5];
+  assert.equal(prompt1.cmd, 'acp-prompt');
+  assert.deepEqual(prompt1.perms, [
+    { tool: 'cmd', outcome: { outcome: 'selected', optionId: 'reject-once' } },
+    { tool: 'web', outcome: { outcome: 'selected', optionId: 'allow-once' } },
+  ]);
+  const promptText1 = prompt1.params.prompt[0].text;
+  assert.match(promptText1, /^Eres Fizzi\./);
+  assert.ok(promptText1.includes(ANTIGRAVITY_NOTE));
+  assert.match(promptText1, /¿Qué hago ahora\?/);
 
-  // Second request with webSearch: false reuses cached login and denies read_url(*).
+  // 3. Second request with webSearch: false reuses cached login and rejects web lookup permission.
+  const countBefore = calls.length;
   await runInLang('en', () => ask({ ...cfg, webSearch: false }, 'You are Fizzi.', messages, {}));
   calls = JSON.parse(fs.readFileSync(logFile, 'utf8'));
-  assert.equal(calls.length, 4, 'cached login skipped agy models');
-  assert.deepEqual(calls[3].settings.permissions.allow, []);
-  assert.ok(calls[3].settings.permissions.deny.includes('read_url(*)'));
+  const slice2 = calls.slice(countBefore);
+  assert.ok(!slice2.some((c) => c.cmd === 'models'), 'cached login skipped agy models');
+  assert.deepEqual(slice2.at(-1).perms, [
+    { tool: 'cmd', outcome: { outcome: 'selected', optionId: 'reject-once' } },
+    { tool: 'web', outcome: { outcome: 'selected', optionId: 'reject-once' } },
+  ]);
+  delete process.env.FAKE_AGY_TEST_PERMS;
 
-  // Effort fallback retry when account default is Orchestrator.
+  // 4. Explicit bare model + effort, and explicit effort-suffixed model against ACP configOptions.
+  const cfgBare = { ...cfg, antigravity: { ...cfg.antigravity, model: 'gemini-4-neon', effort: 'low' } };
+  const rBare = await runInLang('en', () => ask(cfgBare, 'You are Fizzi.', messages, {}));
+  assert.match(rBare.model, /Gemini 4 Neon · your subscription/);
+  calls = JSON.parse(fs.readFileSync(logFile, 'utf8'));
+  assert.equal(calls.at(-1).model, 'gemini-4-neon');
+  assert.equal(calls.at(-1).effort, 'low');
+
+  const cfgSuffixed = { ...cfg, antigravity: { ...cfg.antigravity, model: 'gemini-4-hydrogen-xhigh', effort: 'low' } };
+  await runInLang('en', () => ask(cfgSuffixed, 'You are Fizzi.', messages, {}));
+  calls = JSON.parse(fs.readFileSync(logFile, 'utf8'));
+  assert.equal(calls.at(-1).model, 'gemini-4-hydrogen');
+  assert.equal(calls.at(-1).effort, 'xhigh');
+
+  // 5a. Orchestrator default omits thought_level config option: succeeds without failing on effort.
   process.env.FAKE_AGY_ORCHESTRATOR = '1';
   const rOrch = await runInLang('en', () => ask(cfg, 'You are Fizzi.', messages, {}));
   assert.equal(rOrch.text, 'Ve a Minas de la Muerte.');
-  calls = JSON.parse(fs.readFileSync(logFile, 'utf8'));
-  assert.ok(calls[4].args.includes('--effort'));
-  assert.ok(!calls[5].args.includes('--effort'), 'retried without --effort');
+  assert.match(rOrch.model, /Orchestrator \(Neon\) · your subscription/);
   delete process.env.FAKE_AGY_ORCHESTRATOR;
 
-  // Quota error in EN and ES.
+  // 5b. Model without 'low' in advertised thought_level options selects 'medium' directly.
+  process.env.FAKE_AGY_NO_LOW_EFFORT = '1';
+  await runInLang('en', () => ask(cfg, 'You are Fizzi.', messages, {}));
+  calls = JSON.parse(fs.readFileSync(logFile, 'utf8'));
+  assert.equal(calls.at(-1).effort, 'medium');
+  delete process.env.FAKE_AGY_NO_LOW_EFFORT;
+
+  // 5c. Server rejects 'low' with Thinking level error: falls back to 'medium'.
+  process.env.FAKE_AGY_REJECT_LOW_EFFORT = '1';
+  await runInLang('en', () => ask(cfg, 'You are Fizzi.', messages, {}));
+  calls = JSON.parse(fs.readFileSync(logFile, 'utf8'));
+  assert.equal(calls.at(-1).effort, 'medium');
+  delete process.env.FAKE_AGY_REJECT_LOW_EFFORT;
+
+  // 6. Invalid model selection surfaces localized model error.
+  process.env.FAKE_AGY_REJECT_MODEL = '1';
+  await assert.rejects(
+    runInLang('en', () => ask({ ...cfg, antigravity: { ...cfg.antigravity, model: 'gemini-4-neon' } }, 's', messages, {})),
+    /does not include/,
+  );
+  delete process.env.FAKE_AGY_REJECT_MODEL;
+
+  // 7. Quota error in EN and ES.
   process.env.FAKE_AGY_FAIL = 'weekly rate limit reached';
   await assert.rejects(runInLang('en', () => ask(cfg, 's', messages, {})), /Google AI plan's usage limit/);
   await assert.rejects(runInLang('es', () => ask(cfg, 's', messages, {})), /límite de uso de tu plan de Google AI/);
 
-  // Auth error clears cached login so next call re-checks `agy models`.
+  // 8. Auth error clears cached login so next call re-checks `agy models`.
   process.env.FAKE_AGY_FAIL = 'Authentication required';
   await assert.rejects(runInLang('en', () => ask(cfg, 's', messages, {})), /Sign in/);
   delete process.env.FAKE_AGY_FAIL;
   await runInLang('en', () => ask(cfg, 's', messages, {}));
   calls = JSON.parse(fs.readFileSync(logFile, 'utf8'));
-  assert.equal(calls.at(-2).cmd, 'models', 'login cache was invalidated by auth failure');
+  assert.ok(calls.slice(-5).some((c) => c.cmd === 'models'), 'login cache was invalidated by auth failure');
 
-  // Legacy CLI without `--output-format` falls back cleanly to plain `agy models`.
+  // 9. Legacy CLI without `--output-format` falls back cleanly to plain `agy models`.
   process.env.FAKE_AGY_LEGACY_MODELS = '1';
   const legacyStatus = await antigravityAuthStatus(bin);
   assert.equal(legacyStatus.loggedIn, true);

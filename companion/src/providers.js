@@ -10,9 +10,10 @@ import {
   CODEX_DISABLE, CODEX_MODELS, CODEX_MUST_DISABLE, codexArgs, codexAuthStatus, findCodex, friendlyCodexError, parseCodexEvents,
   rejectedCodexFeatures, shellQuote,
 } from './codex.js';
+import { runAcpPrompt } from './acp.js';
 import {
-  ANTIGRAVITY_NOTE, antigravityArgs, antigravityAuthStatus, antigravityInput, antigravitySettings, antigravityUsage,
-  fallbackAntigravityEffort, findAntigravity, friendlyAntigravityError, parseAntigravityEvents, prettyAntigravityModel,
+  ANTIGRAVITY_NOTE, antigravityAcpArgs, antigravityAuthStatus, fallbackAntigravityEffort, findAntigravity,
+  friendlyAntigravityError, isAntigravityAuthError, prettyAntigravityModel, resolveAntigravityModel,
 } from './antigravity.js';
 
 // Tokens an answer used, the same shape for every provider (shown in the game):
@@ -350,7 +351,7 @@ async function codex(cfg, system, messages) {
 
 let antigravityLogin = { ok: false, at: 0, bin: null };
 
-// Antigravity CLI (`agy`): uses the Google account / Google AI plan you are signed into.
+// Antigravity CLI (`agy`): uses the Google account / Google AI plan you are signed into via ACP.
 async function antigravity(cfg, system, messages) {
   const c = cfg.antigravity;
   const found = findAntigravity(c.bin);
@@ -363,63 +364,44 @@ async function antigravity(cfg, system, messages) {
     if (!s.loggedIn && !s.error) throw new Error(friendlyAntigravityError('not signed in'));
     if (s.loggedIn) antigravityLogin = { ok: true, at: Date.now(), bin: found.path };
   }
-  const { file, shell } = spawnArgs(found.path);
-  const work = sandboxDir();
-  const stamp = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-  const settingsFile = path.join(work, `agy-settings-${stamp}.json`);
-  const webSearch = canSearch(cfg);
-  fs.writeFileSync(settingsFile, JSON.stringify(antigravitySettings({ webSearch }), null, 2), 'utf8');
-  const prompt = antigravityInput(flattenPrompt(`${system}\n\n${ANTIGRAVITY_NOTE}`, messages));
+  const prompt = flattenPrompt(`${system}\n\n${ANTIGRAVITY_NOTE}`, messages);
   const env = { ...process.env, AGY_CLI_DISABLE_AUTO_UPDATE: 'true' };
 
-  const invoke = (effortOverride) => {
-    const args = antigravityArgs(c, { settingsFile, webSearch, timeoutMs: cfg.timeoutMs, effortOverride });
-    return run(file, shell ? shellQuote(args) : args, prompt, cfg.timeoutMs, work, shell, env);
-  };
-
-  const hasExplicitModel = Boolean(c.model && c.model !== 'default');
-  let out;
+  let result;
   try {
-    try {
-      out = await invoke(undefined);
-    } catch (e) {
-      const parsedErr = parseAntigravityEvents(e.stdout);
-      const errMsg = parsedErr.error || e.stderr || e.message;
-      const retryEffort = !hasExplicitModel && c.effort ? fallbackAntigravityEffort(errMsg, c.effort) : undefined;
-      if (retryEffort !== undefined) {
-        out = await invoke(retryEffort);
-      } else {
-        throw e;
-      }
-    }
+    result = await runAcpPrompt({
+      bin: found.path,
+      args: antigravityAcpArgs(c),
+      cwd: sandboxDir(),
+      env,
+      clientInfo: { name: 'forever-ai-companion', version: '1.13.0' },
+      prompt,
+      model: c.model,
+      effort: c.effort,
+      webSearch: canSearch(cfg),
+      resolveModel: resolveAntigravityModel,
+      fallbackEffort: fallbackAntigravityEffort,
+      timeoutMs: cfg.timeoutMs,
+    });
   } catch (e) {
-    out = e.stdout;
-    const parsed = parseAntigravityEvents(out);
-    if (parsed.error) {
-      if (/authentication required|please sign in|not (?:signed|logged) in|log ?in required|\b401\b|unauthori[sz]ed/i.test(parsed.error)) {
-        antigravityLogin = { ok: false, at: 0, bin: null };
-      }
-      throw new Error(friendlyAntigravityError(parsed.error));
-    }
-    throw e;
-  } finally {
-    fs.rmSync(settingsFile, { force: true });
+    if (e?.code === 'ACP_TIMEOUT' || e?.code === 'ACP_SPAWN_ERROR') throw e;
+    if (isAntigravityAuthError(e)) antigravityLogin = { ok: false, at: 0, bin: null };
+    throw new Error(friendlyAntigravityError(e?.message || String(e)));
   }
 
-  const parsed = parseAntigravityEvents(out);
-  if (parsed.error) {
-    if (/authentication required|please sign in|not (?:signed|logged) in|log ?in required|\b401\b|unauthori[sz]ed/i.test(parsed.error)) {
-      antigravityLogin = { ok: false, at: 0, bin: null };
-    }
-    throw new Error(friendlyAntigravityError(parsed.error));
+  if (result.stopReason === 'refusal' && !result.text.trim()) {
+    throw err('refused');
   }
-  const text = parsed.text;
+  let text = result.text;
+  if (result.stopReason === 'max_tokens' && text.trim()) {
+    text += ' [...]';
+  }
   if (!text.trim()) throw err('antigravityNoAnswer');
-  const name = prettyAntigravityModel(parsed.model || c.model);
+  const name = prettyAntigravityModel(result.model || c.model);
   return {
     text,
     model: `${name || 'Gemini'} · ${t('yourSubscription')}`,
-    usage: antigravityUsage(parsed.usage),
+    usage: result.usage,
   };
 }
 

@@ -189,7 +189,7 @@ Every command works with both **`/ai`** and **`/ia`**: `/ai` comes from English 
 
 With the subscriptions, the app installs the official program (**Claude Code** by Anthropic, **Codex** by OpenAI, or **Antigravity CLI** by Google) and opens your browser to sign in. Your questions count toward your plan's usage limit.
 
-> **My Gemini subscription is at your own risk.** Google's [Antigravity terms](https://antigravity.google/terms) forbid accessing it through third-party tools and say accounts can be suspended for it. This app runs Google's own `agy` program rather than reusing its sign-in, but Google has not said whether that is allowed. If your Google account matters to you, choose another option.
+> **My Gemini subscription is at your own risk.** Google's [Antigravity terms](https://antigravity.google/terms) restrict third-party access and permit suspending accounts for violations. This app connects to Google's official `agy` binary through its documented [Agent Client Protocol (ACP)](https://antigravity.google/docs/cli/acp) interface (`agy acp --stdio`) rather than extracting tokens or overriding internal settings, which puts the integration on more defensible footing—however, non-IDE usage remains a grey area and Google has not explicitly confirmed whether companion apps like this are permitted. If your Google account is important to you, choose another option.
 
 You can change the AI or the model at any time from the app's dashboard (**Change**, next to *Artificial intelligence*).
 
@@ -265,7 +265,7 @@ That's why you need to **restart WoW** after installing: the game only sees file
 - **Your data and the question**, plus the earlier questions of the same chat.
 - If the AI can, it **searches the internet** for whatever the guide doesn't cover (a few seconds more), with its own search tools: it's told to prefer WoW Forever guides (Wowhead, Warcraft Tavern, Method, Maxroll, the Fextralife wiki) and to search before saying it doesn't know something. It can be turned off in the dashboard.
 
-With the subscriptions, Claude Code and Codex run as a plain chat: our instructions replace their coding ones, with no access to your files or commands, without your settings and without saving sessions. Antigravity CLI runs in headless mode inside an empty temporary folder with per-call settings that deny local file, command and MCP tools (and only allow web reading when internet search is enabled).
+With the subscriptions, Claude Code and Codex run as a plain chat: our instructions replace their coding ones, with no access to your files or commands, without your settings and without saving sessions. Antigravity CLI runs through its standard Agent Client Protocol (`agy acp --stdio`) inside an empty temporary folder with no client capabilities or MCP servers, rejecting local file, command, and browser permission requests (and allowing public web/URL lookups only when internet search is enabled).
 
 ---
 
@@ -354,7 +354,7 @@ Blizzard's Terms of Use and EULA forbid bots, cheats and unauthorized third-part
 2. **Blizzard can break it at any time.** If Blizzard doesn't like this kind of tool, the most likely result is a game patch that closes one of these paths, for example by limiting the text-to-speech or sound functions, rather than action against accounts. Blizzard already restricted combat addons heavily in Midnight, the engine WoW Forever runs on. If that happens, the assistant stops working until another way is found, if one exists.
 3. **Action against your account is possible.** Because it doesn't automate anything or touch the game's memory, we consider the risk low, but Blizzard has the final word on what its Terms of Use allow, and its rules and how it enforces them can change. If your account matters more to you than the convenience, don't use it.
 4. **The AI can be wrong.** Answers can be inaccurate or out of date, especially about things that change with patches. Double-check before spending a lot of gold or time on an answer.
-5. **Your AI provider's terms apply too.** Using Claude, Codex, Antigravity or an API key through this app is subject to that provider's own terms and limits. Google's Antigravity terms in particular forbid third-party tools and allow suspending accounts for it (see [Which AI to choose](#which-ai-to-choose)).
+5. **Your AI provider's terms apply too.** Using Claude, Codex, Antigravity or an API key through this app is subject to that provider's own terms and limits. Google's Antigravity terms in particular restrict third-party access and allow account suspension; even though this app uses the documented `agy acp` interface, non-IDE use remains a grey area (see [Which AI to choose](#which-ai-to-choose)).
 
 ---
 
@@ -434,7 +434,8 @@ companion/
   src/providers.js          Claude, OpenAI/Gemini/Grok/Ollama, Claude Code, Codex, Antigravity, test
   src/codex.js              Codex: install, sign-in and running it
   src/claude-code.js        Claude Code: install and sign-in
-  src/antigravity.js        Antigravity CLI: install, sign-in and running it
+  src/acp.js                Generic ACP (Agent Client Protocol) stdio client
+  src/antigravity.js        Antigravity CLI: install, sign-in and ACP configuration
   src/tts-voice.js          Installs the silent voice
   src/migrate.js            Moves installs from the project's previous name
   tts/ForeverAICompanionTts.cs  Silent voice engine (C#)

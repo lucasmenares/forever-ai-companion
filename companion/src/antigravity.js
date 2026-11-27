@@ -1,11 +1,12 @@
 // Google Antigravity CLI (`agy`): lets players use their Google account or
 // Google AI Pro / Ultra subscription. Finds it on this PC, checks the sign-in,
-// helps install it and sign in, and runs it in headless stream-json mode as a
-// plain chat model.
+// helps install it and sign in, and runs it via `agy acp --stdio` as a plain
+// chat model.
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { execFile, spawn } from 'node:child_process';
+import { acpUsage, killChild, pickFallbackEffort } from './acp.js';
 import { macTerminal, spawnArgs, visibleConsole } from './claude-code.js';
 import { openUrl as defaultOpenUrl } from './app/system.js';
 import { pathDirs, shellQuote } from './codex.js';
@@ -163,43 +164,6 @@ export async function antigravityAuthStatus(bin, timeout = 20000) {
     res = await execAntigravity(bin, ['models'], timeout);
   }
   return parseAntigravityAuthStatus(res.code, res.stdout, res.stderr);
-}
-
-function killProcessTree(pid) {
-  if (!isWin || !pid) return Promise.resolve();
-  return new Promise((resolve) => {
-    const taskkill = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'taskkill.exe');
-    execFile(taskkill, ['/PID', String(pid), '/T', '/F'], { windowsHide: true, timeout: 10000 }, () => resolve());
-  });
-}
-
-function killChild(child) {
-  if (!child || !child.pid || child.exitCode !== null || child.signalCode !== null) {
-    return Promise.resolve();
-  }
-  if (isWin) return killProcessTree(child.pid);
-  return new Promise((resolve) => {
-    let done = false;
-    let killTimer = null;
-    const finish = () => {
-      if (done) return;
-      done = true;
-      if (killTimer) clearTimeout(killTimer);
-      resolve();
-    };
-    child.once('close', finish);
-    try {
-      child.kill('SIGTERM');
-    } catch {
-      finish();
-      return;
-    }
-    killTimer = setTimeout(() => {
-      try { child.kill('SIGKILL'); } catch { /* already exited */ }
-      finish();
-    }, 1500);
-    killTimer.unref?.();
-  });
 }
 
 export const ANTIGRAVITY_CODE_REDIRECT_URI = 'https://antigravity.google/oauth-callback';
@@ -775,15 +739,16 @@ export async function submitAntigravityLoginCode(rawCode, { exchangeTimeoutMs = 
   throw new Error(message);
 }
 
-// --- Running headless chat turns --------------------------------------------
+// --- Running chat turns via ACP ---------------------------------------------
 
 // Chat-only guardrail: replaces coding-agent assumptions when talking to the player.
 export const ANTIGRAVITY_NOTE = `## Tools
 Do not run commands or read or write files: nothing on this PC helps answer. Answer directly from the character data, the guide and, if allowed above, a web search.`;
 
-// Maps (model, effort) onto `agy --model` / `agy --effort` flags.
-// Bare Gemini 4 / 3.8 Flash names take effort as a suffix; `default` uses --effort;
-// explicit variant slugs and Orchestrators stay untouched without --effort.
+// Maps (model, effort) for Antigravity model slugs:
+// Bare Gemini 4 / 3.8 Flash names take effort as a suffix when the ACP server
+// only exposes variant slugs or uses legacy `session/set_model`; `default` keeps
+// effort for `thought_level`; explicit variants and Orchestrators stay untouched.
 export function resolveAntigravityModel(model, effort) {
   const m = String(model || '').trim();
   const e = String(effort || '').trim().toLowerCase();
@@ -792,127 +757,49 @@ export function resolveAntigravityModel(model, effort) {
   return { model: m, effort: null };
 }
 
-// If `default` + `--effort` is rejected (e.g. Orchestrator or a model without `low`),
-// returns the next effort string to retry with, `null` to drop `--effort`, or
-// `undefined` when the error is unrelated.
-export function fallbackAntigravityEffort(errorText, currentEffort) {
+// If `default` + effort/thought_level is rejected (e.g. Orchestrator or a model
+// without `low`), returns the next effort string to retry with, `null` to skip
+// setting effort, or `undefined` when the error is unrelated.
+export function fallbackAntigravityEffort(errorText, currentEffort, available = null) {
   const text = String(errorText || '');
   if (/effort\s+(?:isn't|is not)\s+adjustable/i.test(text)) return null;
+  if (/thinking level\s+["'`]?[a-z]+["'`]?\s+is not (?:offered|available)/i.test(text)) {
+    const cur = String(currentEffort || '').trim().toLowerCase();
+    const rest = (Array.isArray(available) ? available : [])
+      .filter((v) => String(v || '').trim().toLowerCase() !== cur);
+    return rest.length ? pickFallbackEffort(rest, cur) : null;
+  }
   const m = /has no ["'`]?[a-z]+["'`]? effort\s*\(\s*available\s*:\s*([^)]+)\)/i.exec(text);
   if (!m) return undefined;
-  const available = m[1].split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
-  if (!available.length) return null;
-  if (String(currentEffort || '').toLowerCase() === 'low' && available.includes('medium')) return 'medium';
-  if (available.includes('low')) return 'low';
-  if (available.includes('medium')) return 'medium';
-  return available[0];
+  const parsed = m[1].split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+  return parsed.length ? pickFallbackEffort(parsed, currentEffort) : null;
 }
 
-// Ephemeral `--settings` payload written per call (never saved to the user's settings.json).
-export function antigravitySettings({ webSearch = false } = {}) {
-  const deny = ['command(*)', 'read_file(*)', 'write_file(*)', 'execute_url(*)', 'mcp(*)'];
-  if (!webSearch) deny.push('read_url(*)');
-  return {
-    agentMode: '',
-    toolPermission: 'request-review',
-    allowNonWorkspaceAccess: false,
-    enableTerminalSandbox: true,
-    disableSlashCommands: true,
-    permissions: {
-      allow: webSearch ? ['read_url(*)'] : [],
-      deny,
-    },
-  };
+export function antigravityAcpArgs(c = {}) {
+  return ['acp', '--stdio', ...(c?.extraArgs || [])];
 }
 
-export function antigravityArgs(c, { settingsFile, webSearch = false, timeoutMs, effortOverride } = {}) {
-  const eff = effortOverride !== undefined ? effortOverride : c.effort;
-  const resolved = resolveAntigravityModel(c.model, eff);
-  const args = [
-    '--input-format', 'stream-json',
-    '--output-format', 'stream-json',
-    '--disable-slash-commands',
-    '--sandbox',
-  ];
-  if (settingsFile) args.push('--settings', settingsFile);
-  if (timeoutMs) args.push('--print-timeout', `${Math.max(1, Math.ceil(timeoutMs / 1000))}s`);
-  if (resolved.model) args.push('--model', resolved.model);
-  if (resolved.effort) args.push('--effort', resolved.effort);
-  args.push(...(c.extraArgs || []));
-  return args;
-}
-
-export function antigravityInput(prompt) {
-  return `${JSON.stringify({ event: 'user', message: { content: String(prompt ?? '') } })}\n`;
-}
-
-// Parses NDJSON (`stream-json`) or single `--output-format json` output.
-export function parseAntigravityEvents(stdout) {
-  let resultText = null;
-  let deltas = '';
-  let error = null;
-  let usage = null;
-  let model = null;
-
-  for (const line of String(stdout || '').split(/\r?\n/)) {
-    const trimmed = line.trim();
-    if (!trimmed.startsWith('{')) continue;
-    let ev;
-    try { ev = JSON.parse(trimmed); } catch { continue; }
-
-    if (ev.event === 'init') {
-      if (ev.init?.model) model = ev.init.model;
-    } else if (ev.event === 'step_update') {
-      const su = ev.step_update;
-      if (!su) continue;
-      if (su.model) model = su.model;
-      if (su.step_type === 'agent_response' && typeof su.text_delta === 'string') deltas += su.text_delta;
-      if (su.usage) usage = su.usage;
-    } else if (ev.event === 'result') {
-      const r = ev.result;
-      if (!r) continue;
-      if (r.model) model = r.model;
-      if (r.usage) usage = r.usage;
-      if (r.status && r.status !== 'SUCCESS') {
-        error = r.error || (r.finished_reason ? `${r.status} (${r.finished_reason})` : r.status);
-      } else if (typeof r.response === 'string' && r.response.length > 0) {
-        resultText = r.response;
-      }
-    } else if (typeof ev.status === 'string' && ('response' in ev || 'error' in ev || 'finished_reason' in ev)) {
-      if (ev.model) model = ev.model;
-      if (ev.usage) usage = ev.usage;
-      if (ev.status !== 'SUCCESS') {
-        error = ev.error || (ev.finished_reason ? `${ev.status} (${ev.finished_reason})` : ev.status);
-      } else if (typeof ev.response === 'string' && ev.response.length > 0) {
-        resultText = ev.response;
-      }
-    }
-  }
-
-  return { text: resultText !== null ? resultText : deltas, error, usage, model };
-}
-
-// Gemini reports input_tokens inclusive of cache_read_tokens; Claude reports
-// uncached input_tokens separately, so cache_read_tokens can exceed input_tokens.
+// Normalizes ACP PromptResponse usage or Antigravity CLI token stats into { input, cached, output }.
 export function antigravityUsage(u) {
-  if (!u) return null;
-  const n = (v) => Math.max(0, Math.round(Number(v) || 0));
-  const rawInput = n(u.input_tokens);
-  const cached = n(u.cache_read_tokens);
-  const input = cached > rawInput ? rawInput + cached : rawInput;
-  const output = Math.max(n(u.output_tokens), n(u.thinking_tokens));
-  return { input, cached, output };
+  return acpUsage(u);
+}
+
+const AUTH_ERROR_RE = /authentication required|please sign in|not (?:signed|logged) in|log ?in required|\b401\b|unauthori[sz]ed/i;
+
+export function isAntigravityAuthError(error) {
+  const msg = typeof error === 'string' ? error : String(error?.message || '');
+  return (error?.code === -32000 && /auth|sign in|log ?in/i.test(msg)) || AUTH_ERROR_RE.test(msg);
 }
 
 export function friendlyAntigravityError(message) {
   const m = String(message || '');
-  if (/authentication required|please sign in|not (?:signed|logged) in|log ?in required|\b401\b|unauthori[sz]ed/i.test(m)) {
+  if (AUTH_ERROR_RE.test(m)) {
     return t('antigravitySignedOut');
   }
   if (/usage limit|rate limit|weekly.*limit|\b429\b|quota|out of credits|exhausted|spend[- ]?cap/i.test(m)) {
     return t('antigravityLimit');
   }
-  if (/invalid model|not recognized as a known model|model.*(?:not (?:supported|available|found|recognized)|does not exist)|access to model|not included in your plan/i.test(m)) {
+  if (/unknown model(?:\s+id)?|invalid model|not recognized as a known model|model.*(?:not (?:supported|available|found|recognized)|does not exist)|access to model|not included in your plan|\bmodel\b.*\bis unavailable\b|^["'`]?[a-z0-9][a-z0-9._:/-]+["'`]?\s+is unavailable\b/i.test(m)) {
     return t('antigravityModel');
   }
   return t('antigravityError', { error: m.slice(0, 300) });
