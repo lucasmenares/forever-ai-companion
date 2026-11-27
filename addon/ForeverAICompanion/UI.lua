@@ -141,25 +141,138 @@ local function answerItemLink(id, name)
   return sameName(realName, name) and link or false
 end
 
--- The answer as shown in its bubble: item links working, the rest escaped.
+-- Places in the AI's answers: it writes {{way:Zone|X|Y|Name}} when it gives
+-- coordinates (Zone as the game names it, X/Y 0-100, Name optional). They
+-- become links that set a waypoint: TomTom's when it is installed (guides and
+-- route planners follow it), otherwise the game's own map pin. A zone the game
+-- doesn't know, or coordinates out of range, stay plain text.
+local WAY_TOKEN = "{{way:([^{}]-)}}"
+local WAY_LINK = "faiway"
+
+local function wayParts(body)
+  local zone, x, y, name = tostring(body or ""):match("^([^|]*)|([^|]*)|([^|]*)|?(.-)$")
+  x, y = tonumber(x), tonumber(y)
+  if not (zone and x and y) then return nil end
+  zone = zone:gsub("^%s+", ""):gsub("%s+$", "")
+  name = (name or ""):gsub("^%s+", ""):gsub("%s+$", "")
+  return zone, x, y, name
+end
+
+-- A coordinate with one decimal, as maps show them: 45.0 / 73.6.
+local function coord(v) return string.format("%.1f", v) end
+
+-- "Name (X, Y)", or "Zone (X, Y)" without a name.
+local function wayLabel(zone, x, y, name)
+  return string.format("%s (%s, %s)", name ~= "" and name or zone, coord(x), coord(y))
+end
+
+-- Map ids by name, built once from the game's maps (zones and cities first).
+local mapIdsByName
+local function normName(s) return (tostring(s or ""):lower():gsub("%s+", " "):gsub("^ ", ""):gsub(" $", "")) end
+local function mapIdFor(zone)
+  if not (C_Map and C_Map.GetMapInfo) then return nil end
+  if not mapIdsByName then
+    mapIdsByName = {}
+    local zoneType = Enum and Enum.UIMapType and Enum.UIMapType.Zone or 3
+    for id = 1, 4000 do -- WoW Forever: highest uiMapID 2665
+      local info = C_Map.GetMapInfo(id)
+      if info and info.name and info.name ~= "" then
+        local key = normName(info.name)
+        local cur = mapIdsByName[key]
+        if not cur or (info.mapType == zoneType and cur.mapType ~= zoneType) then
+          mapIdsByName[key] = { id = id, mapType = info.mapType }
+        end
+      end
+    end
+  end
+  local key = normName(zone)
+  if key == "" then return nil end
+  -- The zone the player is in (the game's zone text can differ from the map name).
+  if GetRealZoneText and normName(GetRealZoneText()) == key and C_Map.GetBestMapForUnit then
+    local here = C_Map.GetBestMapForUnit("player")
+    if here then return here end
+  end
+  local hit = mapIdsByName[key]
+  return hit and hit.id or nil
+end
+
+local function answerWayLink(body)
+  local zone, x, y, name = wayParts(body)
+  if not zone then return nil end
+  local label = wayLabel(zone, x, y, name)
+  if x <= 0 or x > 100 or y <= 0 or y > 100 then return nil, label end
+  local mapID = mapIdFor(zone)
+  if not mapID then return nil, label end
+  -- The link keeps the name for the waypoint's title (":" and "|" left out).
+  local title = (name ~= "" and name or zone):gsub("[:|]", " ")
+  return string.format("|cff4fc3f7|H%s:%d:%s:%s:%s|h[%s]|h|r", WAY_LINK, mapID, coord(x), coord(y), title, escape(label)), label
+end
+
+-- Sets the waypoint a place link stands for. True when one was set.
+function UI.SetWaypointFromLink(link)
+  local mapID, x, y, title = tostring(link or ""):match("^" .. WAY_LINK .. ":(%d+):([%d%.]+):([%d%.]+):?(.*)$")
+  mapID, x, y = tonumber(mapID), tonumber(x), tonumber(y)
+  if not (mapID and x and y) then return false end
+  title = (title and title ~= "") and title or nil
+  local done = false
+  local tomtom = rawget(_G, "TomTom")
+  if type(tomtom) == "table" and type(tomtom.AddWaypoint) == "function" then
+    local ok, uid = pcall(tomtom.AddWaypoint, tomtom, mapID, x / 100, y / 100,
+      { title = title, from = "ForeverAICompanion", crazy = true, persistent = false })
+    -- TomTom keeps an existing waypoint at the same spot and doesn't point the
+    -- arrow at it again: point it there, so a route planner follows it too.
+    if ok and uid and type(tomtom.SetCrazyArrow) == "function" then
+      pcall(tomtom.SetCrazyArrow, tomtom, uid, nil, title)
+    end
+    done = ok and uid ~= nil
+  end
+  if not done and C_Map and C_Map.SetUserWaypoint and UiMapPoint and UiMapPoint.CreateFromCoordinates then
+    local can = not C_Map.CanSetUserWaypointOnMap or C_Map.CanSetUserWaypointOnMap(mapID)
+    if can then
+      done = pcall(C_Map.SetUserWaypoint, UiMapPoint.CreateFromCoordinates(mapID, x / 100, y / 100))
+      if done and C_SuperTrack and C_SuperTrack.SetSuperTrackedUserWaypoint then
+        pcall(C_SuperTrack.SetSuperTrackedUserWaypoint, true)
+      end
+    end
+  end
+  local where = string.format("%s (%s, %s)", title or "", coord(x), coord(y)):gsub("^ ", "")
+  print("|cff66ccffForever AI:|r " .. (done and string.format(L.WAYPOINT_SET, where) or L.WAYPOINT_FAILED))
+  return done
+end
+
+-- The answer as shown in its bubble: item and place links working, the rest
+-- escaped.
 local function renderAnswer(s)
   s = tostring(s or "")
   local out, pos = {}, 1
   while true do
-    local a, b, id, name = s:find(ITEM_TOKEN, pos)
-    if not a then break end
-    out[#out + 1] = escape(s:sub(pos, a - 1))
-    out[#out + 1] = answerItemLink(id, name) or escape(name)
-    pos = b + 1
+    local ia, ib, id, name = s:find(ITEM_TOKEN, pos)
+    local wa, wb, body = s:find(WAY_TOKEN, pos)
+    if not ia and not wa then break end
+    if wa and (not ia or wa < ia) then
+      out[#out + 1] = escape(s:sub(pos, wa - 1))
+      local link, label = answerWayLink(body)
+      out[#out + 1] = link or escape(label or body)
+      pos = wb + 1
+    else
+      out[#out + 1] = escape(s:sub(pos, ia - 1))
+      out[#out + 1] = answerItemLink(id, name) or escape(name)
+      pos = ib + 1
+    end
   end
   out[#out + 1] = escape(s:sub(pos))
   return table.concat(out)
 end
 UI.RenderAnswer = renderAnswer
 
--- The answer as plain text (copy window, notifications): "[Name]" for items.
+-- The answer as plain text (copy window, notifications): "[Name]" for items,
+-- "Name (X, Y)" for places.
 function UI.PlainAnswer(s)
-  return (tostring(s or ""):gsub(ITEM_TOKEN, "[%2]"))
+  s = tostring(s or ""):gsub(ITEM_TOKEN, "[%2]")
+  return (s:gsub(WAY_TOKEN, function(body)
+    local zone, x, y, name = wayParts(body)
+    return zone and wayLabel(zone, x, y, name) or body
+  end))
 end
 
 -- Items the game was still loading: show them as links once they arrive.
@@ -907,11 +1020,20 @@ function UI:Bubble(i)
   if box.SetHyperlinksEnabled then
     pcall(box.SetHyperlinksEnabled, box, true)
     box:SetScript("OnHyperlinkClick", function(self, link, linkText, button)
+      if tostring(link):find("^" .. WAY_LINK .. ":") then
+        UI.SetWaypointFromLink(link)
+        return
+      end
       if SetItemRef then pcall(SetItemRef, link, linkText, button, self) end
     end)
     box:SetScript("OnHyperlinkEnter", function(self, link)
       if not GameTooltip then return end
       GameTooltip:SetOwner(self, "ANCHOR_CURSOR")
+      if tostring(link):find("^" .. WAY_LINK .. ":") then
+        GameTooltip:SetText(L.WAYPOINT_TIP)
+        GameTooltip:Show()
+        return
+      end
       if pcall(GameTooltip.SetHyperlink, GameTooltip, link) then GameTooltip:Show() else GameTooltip:Hide() end
     end)
     box:SetScript("OnHyperlinkLeave", function() if GameTooltip then GameTooltip:Hide() end end)

@@ -1215,6 +1215,45 @@ test('items in the AI answer become links only when the id really is that item',
   assert.equal(plain, 'Usa [anillo del alba], no [Hacha], y [Capa]. 5|5');
 });
 
+test('places in the AI answer become waypoint links only for a zone the game knows', () => {
+  const maps = `
+    MAPS = { [69] = { name = "Feralas", mapType = 3 }, [1411] = { name = "Durotar", mapType = 3 },
+             [1454] = { name = "Orgrimmar", mapType = 3 } }
+    C_Map = C_Map or {}
+    C_Map.GetMapInfo = function(id) return MAPS[id] end
+    C_Map.GetBestMapForUnit = function() return 1411 end
+    GetRealZoneText = function() return "Durotar" end
+    WAYPOINTS = {}
+    TomTom = {
+      AddWaypoint = function(self, m, x, y, opts)
+        WAYPOINTS[#WAYPOINTS + 1] = m .. "@" .. x .. "," .. y .. "@" .. tostring(opts.title) .. "@" .. tostring(opts.crazy)
+        return { m, x, y }
+      end,
+      SetCrazyArrow = function(self, uid) ARROW = uid[1] end,
+    }
+  `;
+  const out = runLua(`
+    local answer = "Geh zu {{way:feralas|73.6|45.0|Rok Orhan}}, dann {{way:Durotar|52|43|}}, "
+      .. "nicht {{way:Atlantis|10|10|Nirgends}} oder {{way:Feralas|0|200|Fehler}}. {{item:1|X}}"
+    local shown = ns.UI.RenderAnswer(answer)
+    local link = shown:match("|H(faiway:[^|]+)|h")
+    local set = ns.UI.SetWaypointFromLink(link)
+    RESULT = shown .. "#" .. link .. "#" .. tostring(set) .. "#" .. table.concat(WAYPOINTS, ";") .. "#" .. tostring(ARROW)
+      .. "#" .. ns.UI.PlainAnswer(answer)
+  `, {}, ALL_FILES, maps + RECORD_TEXT + PRELUDE_DRIVE);
+  const [shown, link, set, waypoints, arrow, plain] = out.split('#');
+  assert.equal(shown,
+    'Geh zu |cff4fc3f7|Hfaiway:69:73.6:45.0:Rok Orhan|h[Rok Orhan (73.6, 45.0)]|h|r, dann '
+    + '|cff4fc3f7|Hfaiway:1411:52.0:43.0:Durotar|h[Durotar (52.0, 43.0)]|h|r, '
+    + 'nicht Nirgends (10.0, 10.0) oder Fehler (0.0, 200.0). X',
+    'known zone (any case): a link; unknown zone or coordinates out of range: plain text');
+  assert.equal(link, 'faiway:69:73.6:45.0:Rok Orhan');
+  assert.equal(set, 'true');
+  assert.equal(waypoints, '69@0.736,0.45@Rok Orhan@true', 'TomTom gets the map id, 0-1 coordinates and the name');
+  assert.equal(arrow, '69', 'the arrow points at it even when TomTom already had that waypoint');
+  assert.equal(plain, 'Geh zu Rok Orhan (73.6, 45.0), dann Durotar (52.0, 43.0), nicht Nirgends (10.0, 10.0) oder Fehler (0.0, 200.0). [X]');
+});
+
 test('a new chat suggests questions about the game window that is open (vendor, auction house...)', () => {
   const out = runLua(`
     START()
